@@ -17,6 +17,7 @@ from random import sample
 import os
 import pandas as pd
 import time
+import datetime
 import numpy as np
 import seaborn as sns
 import logging
@@ -102,8 +103,6 @@ def denormalize_abundance(df, total_raw_abundance, scaling_factor):
     """
     df['abundance'] = (df['abundance'] * total_raw_abundance) / scaling_factor
     return df  # Return df both for the blank and the sample.
-
-
 
 def merged_dataframes(sample_df,blank_df):
     # Merge on taxonomy (Sample, blank and mock)
@@ -262,15 +261,25 @@ def low_quality_sample_decontamination(df):
 
     For each genus, we want to reduce or redistribute abundance among flagged species.
     """
+    logging.info("Labelling blank contaminants based on abundance thresholds (No: 0, Low: <10, Medium: 10-100, High: >100)")
+    def label_abundance(x):
+        if x >= 100:
+            return "High abundance contaminant"
+        elif x >= 10 and x < 100:
+            return "Medium abundance contaminant"
+        elif x < 10 and x > 0:
+            return "Low abundance contaminant"
+        else:
+            return "No abundance"
+
+    df["contaminant_level"] = df["abundance_blank"].apply(label_abundance)
 
     # Create copies of the DataFrame for the different approaches.
     df_proportional_approach_1 = df.copy()
     df_sigfraction_approach_2 = df.copy()
     df_flagonly_approach_3 = df.copy()
-    print(df_proportional_approach_1)#debugging
+    #print(df_proportional_approach_1)#debugging
 
-
-    # ALTERATION: Testing out three approaches!!
     # 1: Penalize proportionally unflagged and flagged
     # 2: Penalise proportionally unflagged and flagged but only if the flagged species are
     # a significant fraction of the genus
@@ -319,25 +328,59 @@ def low_quality_sample_decontamination(df):
 
         return group
 
-    def genus_correction_flagged_only(group):
+    def genus_correction_flagged_only(group, penalty_fraction=0.2):
         """
-        Approach 3: Zero or reduce abundance ONLY for flagged species in this genus,
-        do nothing to unflagged species.
+        Approach 3: For each genus group, adjust abundance_sample only for rows flagged as contaminants,
+        based on their contaminant_level. Unflagged rows remain unchanged.
+
+        If any species in the genus is flagged as a contaminant, then reduce the abundance of
+        all species in that genus by the penalty_fraction.
+
+        The rules are:
+        - If contaminant_level is "High abundance contaminant", set abundance_sample to 0.
+        - If contaminant_level is "Medium abundance contaminant", reduce abundance_sample by multiplying by (1 - penalty_fraction).
+        - If contaminant_level is "Low abundance contaminant", reduce abundance_sample by multiplying by (1 - 2*penalty_fraction),
+        ensuring the value does not go negative.
+        - Otherwise, leave abundance_sample unchanged.
+
+            :param group: pd.DataFrame for one genus (must include 'contaminant_flag', 'contaminant_level', and 'abundance_sample')
+            :param penalty_fraction: float (if 1.0, then complete removal for medium, and double that for low)
+            :return: group with adjusted 'abundance_sample'
         """
-        flagged_mask = group['contaminant_flag'] == True
+        def adjust_row(row):
+            if row.get("contaminant_flag", False):
+                level = row.get("contaminant_level", "No abundance").lower()
+                if "high abundance contaminant" in level:
+                    return 0
+                elif "medium abundance" in level:
+                    return max(row["abundance_sample"] * (1 - penalty_fraction), 0)
+                elif "low abundance contaminant" in level:
+                    return max(row["abundance_sample"] * (1 - 2 * penalty_fraction), 0)
+                else:
+                    return 0
+            else:
+                return row["abundance_sample"]
+        #Apply the adjustment row-by-row.
+        group["abundance_sample"] = group.apply(adjust_row, axis=1)
+        return group
+
+        #Old!
+        #flagged_mask = group['contaminant_flag'] == True
         # For flagged species, you can set to zero or apply a partial penalty:
-        group.loc[flagged_mask, 'abundance_sample'] = 0
+        #group.loc[flagged_mask, 'abundance_sample'] = 0
+        #return group
+
         return group
 
     # Apply Approach 1: Penalize proportionally for all taxa in a genus.
-    df_proportional_approach_1 = df_proportional_approach_1.groupby('genus', group_keys=False).apply(genus_correction_proportional(df_proportional_approach_1))
+    df_proportional_approach_1 = df_proportional_approach_1.groupby('genus', group_keys=False).apply(lambda g: genus_correction_proportional(g))
     """
     PROS: Any contamination in the genus reduces the entire genus proportionally
     CON: Any amount of flagged contamination can penalize the entire genus severely
     (if the flagged fraction is small but not trivial)
     """
 
-    df_sigfraction_approach_2 = df_sigfraction_approach_2.groupby('genus', group_keys=False).apply(sig_fraction_genus_correction(df_sigfraction_approach_2))
+    df_sigfraction_approach_2 = df_sigfraction_approach_2.groupby('genus', group_keys=False).apply(lambda g: sig_fraction_genus_correction(g, min_flagged_fraction=0.2))
     """
     group by genus, apply threshold-based correction.
     PROS: Avoids punishing the entire genus if only a small fraction is flagged
@@ -345,7 +388,7 @@ def low_quality_sample_decontamination(df):
     The threshold is an arbitrary cutoff that needs careful tuning.
     """
 
-    df_flagonly_approach_3 = df_flagonly_approach_3.groupby('genus', group_keys=False).apply(genus_correction_flagged_only(df_flagonly_approach_3))
+    df_flagonly_approach_3 = df_flagonly_approach_3.groupby('genus', group_keys=False).apply(lambda g: genus_correction_flagged_only(g, penalty_fraction=1.0))
     """
     group by genus, only penalize flagged species.
     PROS: Minimal risk of removing real data for unflagged species.
@@ -367,7 +410,7 @@ def filter_low_abundance(df, filter_threshold):
     Filter out taxa with abundance below the threshold.
     Sort by descending abundance.
     """
-    print(f"These are the current columns:{df.columns.tolist()}")
+    #print(f"These are the current columns:{df.columns.tolist()}")
 
     if df is not None:
         df = df[df['abundance_sample'] >= filter_threshold].copy()
@@ -440,17 +483,19 @@ def save_results(output_df, output_dict, output_dir, single_df=True):
     Save each dataframe in the output dictionary as an TSV file in the given dictionary
     """
     os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%H%M")  # Records timestamp (hours & minutes) to append to the file name
 
     if single_df:
         output_df = output_df[['taxonomy', 'abundance_sample']].copy()
         output_df.rename(columns={'abundance_sample': 'abundance'}, inplace=True)
-        output_df.to_csv(os.path.join(output_dir, "high_quality_decontaminated.tsv"), sep='\t', index=False)
+        filename= f"high_quality_decontaminated_{timestamp}.tsv"
+        output_df.to_csv(os.path.join(output_dir, filename), sep='\t', index=False)
         logging.info( f"Decontaminated sample rows: {len(output_df)}; total sample abundance: {output_df['abundance'].sum()}")
-        logging.info(f"Saving results to high_quality_decontaminated.tsv")
+        logging.info(f"Saving results to {filename}")
 
     else:
         for key, output_df in output_dict.items():
-            output_filename = os.path.join(output_dir, f"{key}.tsv")
+            output_filename = os.path.join(output_dir, f"{key}_{timestamp}.tsv")
             output_df.to_csv(output_filename, sep='\t', index=False)
             logging.info(f"Saving results to {output_filename}")
             print(f"Save {key} to {output_filename}")
@@ -506,7 +551,8 @@ if __name__ == "__main__":
     logging.info("Denormalize TSS-scaled abundances to raw abundance")
     sample_df = denormalize_abundance(sample_df, sample_total_raw_abundance, scaling_factor)
     # Saving the de-normalise, raw abundances of the pre-decontaminated sample
-    sample_df.to_csv(os.path.join(output_dir, "de_norm_pre_decontam_sample.tsv"), sep='\t', index=False)
+    timestamp = datetime.datetime.now().strftime("%H%M")#Records timestamp (hours & minutes) to append to the file name
+    sample_df.to_csv(os.path.join(output_dir, f"de_norm_pre_decontam_sample_{timestamp}.tsv"), sep='\t', index=False)
 
     blank_df = denormalize_abundance(blank_df, blank_total_raw_abundance, scaling_factor)
 
@@ -522,41 +568,65 @@ if __name__ == "__main__":
     pd.set_option('display.max_rows', None)
     pd.set_option('display.max_columns', None)
     cols_to_view = ['taxonomy', 'abundance_sample', 'abundance_blank', 'contaminant_flag']
-    print(merged_df[cols_to_view]) #debugging
+    #print(merged_df[cols_to_view]) #debugging
 
     if phred_score > 30:
         logging.info("Apply High quality sample decontamination approach")
         decontaminated_df, output_dict = high_quality_sample_decontamination(merged_df, aggression_factor)
 
-    if phred_score <= 30:
-        logging.info("Apply Low quality sample decontamination approach")
-        decontaminated_df, output_dict = low_quality_sample_decontamination(merged_df)
+        logging.info("Filtering low abundance taxa (<0.1%) for high quality sample")
+        post_decontam_filtered_df = filter_low_abundance(decontaminated_df, filter_threshold)
 
-    logging.info("Filtering low abundance taxa (<0.1%)")
-    post_decontam_filtered_df = filter_low_abundance(decontaminated_df, filter_threshold)
+        # Saving the pre-TSS normalise, filtered post-decontaminated sample.
+        timestamp = datetime.datetime.now().strftime("%H%M")#Records timestamp (hours & minutes) to append to the file name
+        pre_tss_filename = os.path.join(output_dir, f"de_norm_post_decontam_sample_{timestamp}.tsv")
+        decontaminated_df.to_csv(pre_tss_filename, sep='\t', index=False)
+        logging.info(f"Saved pre-TSS normalized high quality decontaminated sample to {pre_tss_filename}")
 
-    # Saving the de-normalise, raw abundances of the post-decontaminated sample.
-    post_decontam_filtered_df.to_csv(os.path.join(output_dir, "de_norm_post_decontam_sample.tsv"), sep='\t', index=False)
+        logging.info("Normalise with TSS-scaling for high quality sample")
+        post_decontam_filt_norm_df = re_tss_normalize(post_decontam_filtered_df, scaling_factor)
 
-    logging.info("Normalise with TSS-scaling..")
-    post_decontam_filt_norm_df = re_tss_normalize(post_decontam_filtered_df, scaling_factor)
+        # logging.info("Recording borderline species taxa")
+        # log_penalty_statistics(sample_df, post_decontam_filt_norm_df)
+        # alteration: need a save output to file
 
-#section~~~~~~~~~ Working from here ~~~~~~~~~~~~#
-    #logging.info("Recording borderline species taxa")
-    #log_penalty_statistics(sample_df, post_decontam_filt_norm_df)
-    #alteration: need a save output to file
-
-    logging.info("Saving results...")
-
-    print("This is the final post-decontaminated df")
-    print(post_decontam_filt_norm_df)
-
-    if phred_score > 30:
+        # Save the TSS-normalised final result
         save_results(post_decontam_filt_norm_df, output_dict, output_dir, single_df=True)
-    else:
-        save_results(post_decontam_filtered_df, output_dict, output_dir, single_df=False)
+
+    else: #if Phred score < 30 (low-quality sample)
+        logging.info("Apply Low quality sample decontamination approach")
+        decontaminated_list, output_dict = low_quality_sample_decontamination(merged_df)
+        # decontaminated_df is a list of DataFrames for each approach
+
+        logging.info("Filtering low abundance taxa (<0.1%) for low quality samples (each approach)")
+        post_decontam_filtered_list= [filter_low_abundance(df, filter_threshold) for df in decontaminated_list]
+
+        # Save each filtered dataframe (pre-TSS) with unique filenames
+        for i, df in enumerate(post_decontam_filtered_list):
+            timestamp = datetime.datetime.now().strftime("%H%M")  # Records timestamp (hours & minutes) to append to the file name
+            pre_tss_filename = os.path.join(output_dir, f"de_norm_post_decontam_sample_{i+1}_{timestamp}.tsv")
+            df.to_csv(pre_tss_filename, sep='\t', index=False)
+            logging.info(f"Saved pre-TSS normalised low quality decontaminated sample, approach {i+1}, to {pre_tss_filename}")
+
+        logging.info("Normalising each filtered dataframe with TSS-scaling for low quality sample")
+        post_decontam_filt_norm_list = [re_tss_normalize(df, scaling_factor) for df in post_decontam_filtered_list]
+
+    #alteration: What are the logging options?
+    #alteration: What are the options for the sample inputs etc. - How to put it in the right formatting
+
+        # Save each TSS-normalised dataframe with unique filenames
+        for i, df in enumerate(post_decontam_filt_norm_list):
+            timestamp = datetime.datetime.now().strftime("%H%M")  # Records timestamp (hours & minutes) to append to the file name
+            final_filename = os.path.join(output_dir, f"final_post_decontam_sample_approach_{i+1}_{timestamp}.tsv")
+            df.to_csv(final_filename, sep='\t', index=False)
+            logging.info(f"Saved TSS-normalised low quality decontaminated sample, approach {i+1}, to {final_filename}")
+
+        #OR
+        #If you only need one of the approaches, pass to save_results()
+        #save_results(filtered_list[0], output_dict, output_dir, single_df=False)
 
     end_time = time.time()
     execution_time = round(end_time - start_time, 3)
     logging.info(f"Execution time: {execution_time} seconds")
     print(f"Execution time: {execution_time} seconds")
+
